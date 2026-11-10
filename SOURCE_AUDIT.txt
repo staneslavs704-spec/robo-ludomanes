@@ -1,0 +1,1372 @@
+
+
+======================================================================
+FILE: bot.py
+======================================================================
+import asyncio
+import logging
+from html import escape
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, PreCheckoutQuery, WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
+from app.config import get_settings
+from app.db import SessionLocal, init_db
+from app.models import User, Payment, NftInventory, NftClaim, Spin
+from app.game import ensure_user
+from datetime import datetime, timezone
+
+settings = get_settings()
+logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+log = logging.getLogger("robo_bot")
+router = Router()
+
+
+@router.message(CommandStart())
+async def start(message: Message, bot: Bot):
+    args = message.text.split(maxsplit=1)
+    start_param = args[1].strip() if len(args) > 1 else ""
+    async with SessionLocal() as session:
+        user = await ensure_user(session, {
+            "id": message.from_user.id,
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name,
+            "language_code": message.from_user.language_code,
+        }, start_param)
+    keyboard = None
+    if settings.webapp_url.startswith("https://") and "example.com" not in settings.webapp_url:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚀 Открыть ROBO LUDOMANES", web_app=WebAppInfo(url=settings.webapp_url))
+        ]])
+    await message.answer(
+        f"Привет, <b>{escape(message.from_user.first_name or 'игрок')}!</b>\n\n"
+        "Добро пожаловать в ROBO LUDOMANES. Открой мини-приложение, чтобы посмотреть баланс, задания и рулетки.\n\n"
+        f"Твои рефералы: <b>{user.referrals_count}</b>\n"
+        f"Бесплатные прокрутки: <b>{user.free_spins}</b>",
+        reply_markup=keyboard, parse_mode="HTML"
+    )
+
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "<b>ROBO LUDOMANES — помощь</b>\n"
+        "/start — открыть проект\n"
+        "/paysupport — поддержка по оплатам\n\n"
+        "За каждого нового участника, который впервые запускает бота по твоей ссылке, начисляются баллы. "
+        "За каждые несколько приглашённых выдаётся бесплатная прокрутка.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("paysupport"))
+async def pay_support(message: Message, bot: Bot):
+    details = message.text.partition(" ")[2].strip()
+    await message.answer("Обращение принято. Администратор сможет проверить платёж по вашему Telegram ID. Приложите чек или укажите дату и сумму оплаты.")
+    if settings.admin_id:
+        try:
+            await bot.send_message(settings.admin_id,
+                f"🆘 <b>Обращение по оплате</b>\nПользователь: <code>{message.from_user.id}</code>\n"
+                f"Username: @{escape(message.from_user.username or 'нет')}\nСообщение: {escape((details or 'Без описания')[:1000])}",
+                parse_mode="HTML")
+        except Exception:
+            log.exception("Could not forward paysupport message")
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery, bot: Bot):
+    async with SessionLocal() as session:
+        payment = await session.scalar(select(Payment).where(Payment.payload == query.invoice_payload))
+        valid = bool(settings.paid_wheel_enabled and payment and payment.status == "pending" and payment.user_id == query.from_user.id
+                     and payment.amount == query.total_amount and query.currency == "XTR")
+    await bot.answer_pre_checkout_query(
+        query.id, ok=valid,
+        error_message=None if valid else "Счёт недействителен или уже обработан. Создайте новый счёт."
+    )
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    sp = message.successful_payment
+    async with SessionLocal() as session:
+        payment = await session.scalar(select(Payment).where(Payment.payload == sp.invoice_payload).with_for_update())
+        if not payment:
+            log.error("Payment payload not found: %s", sp.invoice_payload)
+            await message.answer("Платёж получен, но заказ не найден. Напишите /paysupport.")
+            return
+        if payment.status != "pending":
+            await message.answer("Этот платёж уже обработан или возвращён. Повторного зачисления не будет.")
+            return
+        if payment.user_id != message.from_user.id or payment.amount != sp.total_amount or sp.currency != "XTR":
+            log.error("Payment data mismatch for payment %s", payment.id)
+            await message.answer("Не удалось автоматически сопоставить платёж. Напишите /paysupport.")
+            return
+        user = await session.scalar(select(User).where(User.id == payment.user_id).with_for_update())
+        if not user:
+            await message.answer("Профиль не найден. Напишите /paysupport.")
+            return
+        payment.status = "paid"
+        payment.charge_id = sp.telegram_payment_charge_id
+        payment.paid_at = datetime.now(timezone.utc)
+        user.paid_spins += 1
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            log.exception("Duplicate Stars charge detected")
+            await message.answer("Платёж уже обрабатывается. При необходимости напишите /paysupport.")
+            return
+    await message.answer("✅ Оплата подтверждена! Одна платная прокрутка добавлена. Открой мини-приложение и обнови баланс.")
+
+
+@router.message(Command("payments"))
+async def list_payments(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    async with SessionLocal() as session:
+        rows = (await session.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(15))).all()
+    if not rows:
+        await message.answer("Платежей пока нет.")
+        return
+    lines = [f"#{p.id} · user {p.user_id} · {p.amount} {p.currency} · {p.status}" for p in rows]
+    await message.answer("<b>Последние платежи</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("refund"))
+async def refund_payment(message: Message, bot: Bot):
+    if message.from_user.id != settings.admin_id:
+        return
+    raw = message.text.partition(" ")[2].strip()
+    if not raw.isdigit():
+        await message.answer("Формат: /refund ID_ПЛАТЕЖА (ID из /payments)")
+        return
+    async with SessionLocal() as session:
+        hint = await session.get(Payment, int(raw))
+        if not hint:
+            await message.answer("Платёж не найден.")
+            return
+        # Lock order matches paid-spin flow: user first, then payment.
+        user = await session.scalar(select(User).where(User.id == hint.user_id).with_for_update())
+        payment = await session.scalar(select(Payment).where(Payment.id == int(raw)).with_for_update())
+        if not payment or payment.status != "paid" or not payment.charge_id:
+            await message.answer("Оплаченный платёж не найден или уже обработан.")
+            return
+        if payment.consumed_at is not None:
+            await message.answer("Эта прокрутка уже использована. Автоматический возврат заблокирован, чтобы не возвращать оплату за уже выданную услугу.")
+            return
+        try:
+            await bot.refund_star_payment(user_id=payment.user_id, telegram_payment_charge_id=payment.charge_id)
+        except Exception:
+            log.exception("Telegram Stars refund failed")
+            await message.answer("Telegram не подтвердил возврат. Проверьте лог и статус платежа.")
+            return
+        payment.status = "refunded"
+        if user and user.paid_spins > 0:
+            user.paid_spins -= 1
+        await session.commit()
+    await message.answer(f"✅ Возврат по платежу #{raw} отправлен в Telegram.")
+
+
+@router.message(Command("stats"))
+async def stats(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    async with SessionLocal() as session:
+        users = await session.scalar(select(func.count()).select_from(User))
+        spins = await session.scalar(select(func.count()).select_from(Spin))
+        claims = await session.scalar(select(func.count()).select_from(NftClaim).where(NftClaim.status != "fulfilled"))
+        gifts = await session.scalar(select(func.count()).select_from(NftInventory).where(NftInventory.status == "available"))
+    await message.answer(f"📊 <b>Статистика</b>\nПользователей: {users}\nПрокруток: {spins}\nНезакрытых заявок: {claims}\nСвободных NFT: {gifts}", parse_mode="HTML")
+
+
+@router.message(Command("addgift"))
+async def add_gift(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    raw = message.text.partition(" ")[2]
+    parts = [x.strip() for x in raw.split("|", 2)]
+    if len(parts) < 2 or not parts[0] or not parts[1].startswith("https://"):
+        await message.answer("Формат:\n/addgift Название подарка | https://ссылка-на-подарок | https://ссылка-на-картинку (необязательно)")
+        return
+    image_url = parts[2] if len(parts) > 2 and parts[2].startswith("https://") else None
+    async with SessionLocal() as session:
+        gift = NftInventory(title=parts[0][:160], gift_url=parts[1], image_url=image_url)
+        session.add(gift)
+        await session.commit()
+        await session.refresh(gift)
+    await message.answer(f"✅ Подарок добавлен в пул. ID: <code>{gift.id}</code>", parse_mode="HTML")
+
+
+@router.message(Command("giftstock"))
+async def gift_stock(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    async with SessionLocal() as session:
+        rows = (await session.scalars(select(NftInventory).order_by(NftInventory.id.desc()).limit(30))).all()
+    if not rows:
+        await message.answer("Склад пуст. Добавить подарок: /addgift Название | https://ссылка")
+        return
+    text = "<b>Склад подарков</b>\n" + "\n".join(f"#{g.id} — {escape(g.title)} ({g.status})" for g in rows)
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("fulfill"))
+async def fulfill_claim(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    raw = message.text.partition(" ")[2].strip()
+    if not raw.isdigit():
+        await message.answer("Формат: /fulfill ID_ЗАЯВКИ")
+        return
+    async with SessionLocal() as session:
+        claim = await session.get(NftClaim, int(raw))
+        if not claim:
+            await message.answer("Заявка не найдена")
+            return
+        claim.status = "fulfilled"
+        nft = await session.get(NftInventory, claim.nft_id)
+        gift_title = nft.title if nft else "NFT-подарок"
+        user_id = claim.user_id
+        if nft:
+            nft.status = "fulfilled"
+        await session.commit()
+    try:
+        await message.bot.send_message(user_id, f"🎁 Твоя заявка #{raw} обработана. Подарок: {escape(gift_title)}. Администратор завершил выдачу.", parse_mode="HTML")
+    except Exception:
+        log.exception("Could not notify user about fulfilled NFT claim")
+    await message.answer(f"✅ Заявка #{raw} отмечена как выполненная.")
+
+
+async def main():
+    if not settings.is_configured:
+        raise RuntimeError("Заполните BOT_TOKEN и ADMIN_ID в .env")
+    await init_db()
+    bot = Bot(settings.bot_token)
+    dp = Dispatcher()
+    dp.include_router(router)
+    log.info("ROBO LUDOMANES bot started")
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+======================================================================
+FILE: app/__init__.py
+======================================================================
+
+
+======================================================================
+FILE: app/config.py
+======================================================================
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    bot_token: str = ""
+    admin_id: int = 0
+    webapp_url: str = "https://example.com"
+    database_url: str = "sqlite+aiosqlite:///./database.db"
+    stars_per_spin: int = 50
+    paid_wheel_enabled: bool = False
+    quest_spin_cost: int = 100
+    referrals_per_free_spin: int = 3
+    points_per_referral: int = 10
+    points_for_channel: int = 50
+    required_channel: str = ""
+    channel_url: str = ""
+    init_data_max_age_seconds: int = 86400
+    log_level: str = "INFO"
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.bot_token and ":" in self.bot_token and self.admin_id > 0)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+======================================================================
+FILE: app/db.py
+======================================================================
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import event
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import event
+from app.config import get_settings
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+settings = get_settings()
+connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+engine_options = {
+    "echo": False,
+    "pool_pre_ping": True,
+    "connect_args": connect_args,
+}
+if not settings.database_url.startswith("sqlite"):
+    engine_options.update({"pool_size": 10, "max_overflow": 20, "pool_timeout": 30, "pool_recycle": 1800})
+engine = create_async_engine(settings.database_url, **engine_options)
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def init_db() -> None:
+    # Import models so SQLAlchemy registers every table.
+    from app import models  # noqa: F401
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_session():
+    async with SessionLocal() as session:
+        yield session
+
+
+======================================================================
+FILE: app/game.py
+======================================================================
+import secrets
+from datetime import datetime, timezone
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
+from app.models import User, Spin, NftInventory, NftClaim, Payment
+from app.config import get_settings
+
+settings = get_settings()
+
+
+async def ensure_user(session: AsyncSession, tg_user: dict, start_param: str = "") -> User:
+    user_id = int(tg_user["id"])
+    user = await session.get(User, user_id)
+    if user:
+        user.username = tg_user.get("username")
+        user.first_name = tg_user.get("first_name") or user.first_name
+        user.language_code = tg_user.get("language_code")
+        await session.commit()
+        return user
+
+    referrer_id = None
+    if start_param.startswith("ref_"):
+        try:
+            candidate = int(start_param[4:])
+            if candidate != user_id and await session.get(User, candidate):
+                referrer_id = candidate
+        except (TypeError, ValueError):
+            pass
+    user = User(
+        id=user_id,
+        username=tg_user.get("username"),
+        first_name=tg_user.get("first_name") or "Игрок",
+        language_code=tg_user.get("language_code"),
+        referred_by=referrer_id,
+    )
+    session.add(user)
+    try:
+        if referrer_id:
+            referrer = await session.get(User, referrer_id, with_for_update=True)
+            if referrer:
+                referrer.referrals_count += 1
+                referrer.quest_points += settings.points_per_referral
+                eligible = referrer.referrals_count // max(1, settings.referrals_per_free_spin)
+                bonus = eligible - referrer.free_spins_granted
+                if bonus > 0:
+                    referrer.free_spins += bonus
+                    referrer.free_spins_granted += bonus
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        user = await session.get(User, user_id)
+        if user:
+            return user
+        raise
+    return user
+
+
+async def execute_spin(session: AsyncSession, user_id: int, wheel_type: str, request_id: str) -> dict:
+    # Idempotency: retrying the same request returns the original result without another debit.
+    existing = await session.scalar(select(Spin).where(Spin.user_id == user_id, Spin.request_id == request_id))
+    if existing:
+        claim_id = None
+        if existing.nft_id:
+            claim = await session.scalar(select(NftClaim).where(NftClaim.spin_id == existing.id))
+            claim_id = claim.id if claim else None
+        return _spin_result(existing, claim_id, replay=True)
+
+    user = await session.scalar(select(User).where(User.id == user_id).with_for_update())
+    if not user or user.is_blocked:
+        raise ValueError("Профиль недоступен")
+    # A second check after taking the user-row lock serializes duplicate concurrent requests.
+    existing = await session.scalar(select(Spin).where(Spin.user_id == user_id, Spin.request_id == request_id))
+    if existing:
+        claim_id = None
+        if existing.nft_id:
+            claim = await session.scalar(select(NftClaim).where(NftClaim.spin_id == existing.id))
+            claim_id = claim.id if claim else None
+        return _spin_result(existing, claim_id, replay=True)
+    payment_credit = None
+    if wheel_type == "free":
+        if user.free_spins < 1:
+            raise ValueError("Нет бесплатных прокруток. Пригласите друзей.")
+        user.free_spins -= 1
+    elif wheel_type == "paid":
+        if not settings.paid_wheel_enabled:
+            raise ValueError("Платная рулетка временно отключена")
+        if user.paid_spins < 1:
+            raise ValueError("Сначала приобретите платную прокрутку за Telegram Stars.")
+        payment_credit = await session.scalar(
+            select(Payment).where(
+                Payment.user_id == user_id, Payment.status == "paid", Payment.consumed_at.is_(None)
+            ).order_by(Payment.created_at).limit(1).with_for_update()
+        )
+        if not payment_credit:
+            raise ValueError("Не удалось сопоставить купленную попытку с платежом. Обратитесь в поддержку.")
+        payment_credit.consumed_at = datetime.now(timezone.utc)
+        user.paid_spins -= 1
+    elif wheel_type == "quest":
+        if user.quest_points < settings.quest_spin_cost:
+            raise ValueError(f"Для этой рулетки нужно {settings.quest_spin_cost} баллов.")
+        user.quest_points -= settings.quest_spin_cost
+    else:
+        raise ValueError("Неизвестная рулетка")
+
+    # Original game balance: 56% empty, 40% points, 4% NFT (only if stock exists).
+    nft_count = await session.scalar(select(func.count(NftInventory.id)).where(NftInventory.status == "available"))
+    outcomes = [("empty", "В этот раз без приза", 56),
+                ("points", "10 баллов", 20),
+                ("points", "25 баллов", 15),
+                ("points", "50 баллов", 5)]
+    if nft_count:
+        outcomes.append(("nft", "NFT-подарок", 4))
+    prize_type, title, weight = secrets.SystemRandom().choices(outcomes, weights=[x[2] for x in outcomes], k=1)[0]
+    points = 0
+    nft_id = None
+    if prize_type == "points":
+        points = int(title.split()[0])
+        user.quest_points += points
+    elif prize_type == "nft":
+        # Lock only the selected inventory row, not the whole stock, to reduce contention.
+        offset = secrets.randbelow(max(1, nft_count))
+        nft = await session.scalar(
+            select(NftInventory).where(NftInventory.status == "available")
+            .order_by(NftInventory.id).offset(offset).limit(1).with_for_update(skip_locked=True)
+        )
+        if not nft:
+            nft = await session.scalar(
+                select(NftInventory).where(NftInventory.status == "available")
+                .order_by(NftInventory.id).limit(1).with_for_update(skip_locked=True)
+            )
+        if nft:
+            nft.status = "reserved"
+            nft_id = nft.id
+            title = nft.title
+        else:
+            # All stock may have been reserved by concurrent winners.
+            prize_type, title, points = "empty", "В этот раз без приза", 0
+
+    spin = Spin(user_id=user_id, request_id=request_id, wheel_type=wheel_type,
+                prize_type=prize_type, prize_title=title, points_awarded=points, nft_id=nft_id,
+                payment_id=payment_credit.id if payment_credit else None)
+    session.add(spin)
+    await session.flush()
+    claim_id = None
+    if nft_id:
+        claim = NftClaim(user_id=user_id, spin_id=spin.id, nft_id=nft_id)
+        session.add(claim)
+        await session.flush()
+        claim_id = claim.id
+    await session.commit()
+    return _spin_result(spin, claim_id, replay=False)
+
+
+def _spin_result(spin: Spin, claim_id: int | None, replay: bool) -> dict:
+    return {
+        "spin_id": spin.id,
+        "wheel_type": spin.wheel_type,
+        "prize_type": spin.prize_type,
+        "title": spin.prize_title,
+        "points_awarded": spin.points_awarded,
+        "claim_id": claim_id,
+        "replayed": replay,
+    }
+
+
+======================================================================
+FILE: app/main.py
+======================================================================
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select, func, text
+from sqlalchemy.ext.asyncio import AsyncSession
+from aiogram import Bot
+from aiogram.types import LabeledPrice
+from app.config import get_settings
+from app.db import init_db, get_session
+from app.models import User, Spin, NftClaim, NftInventory, Payment, TaskClaim
+from app.security import telegram_user
+from app.game import ensure_user, execute_spin
+from app.schemas import SpinRequest, ClaimRequest, TaskClaimRequest
+
+settings = get_settings()
+logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+log = logging.getLogger("robo_ludomanes")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    app.state.bot = Bot(settings.bot_token) if settings.is_configured else None
+    app.state.bot_username = ""
+    if app.state.bot:
+        try:
+            app.state.bot_username = (await app.state.bot.get_me()).username or ""
+        except Exception:
+            log.exception("Could not resolve bot username during startup")
+    yield
+    if app.state.bot:
+        await app.state.bot.session.close()
+
+
+app = FastAPI(title="ROBO LUDOMANES API", version="1.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="templates"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    with open("templates/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "robo-ludomanes"}
+
+
+@app.get("/ready")
+async def ready(session: AsyncSession = Depends(get_session)):
+    await session.execute(text("SELECT 1"))
+    return {"status": "ready", "database": "ok"}
+
+
+async def current_user(
+    request: Request,
+    auth: dict = Depends(telegram_user),
+    session: AsyncSession = Depends(get_session),
+) -> User:
+    tg_user = auth["user"]
+    user = await ensure_user(session, tg_user, auth.get("start_param", ""))
+    if user.is_blocked:
+        raise HTTPException(status_code=403, detail="Аккаунт ограничен")
+    request.state.telegram_user = tg_user
+    return user
+
+
+@app.get("/api/me")
+async def me(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    claims = (await session.execute(
+        select(NftClaim, NftInventory)
+        .join(NftInventory, NftInventory.id == NftClaim.nft_id)
+        .where(NftClaim.user_id == user.id)
+        .order_by(NftClaim.created_at.desc()).limit(20)
+    )).all()
+    recent = (await session.scalars(
+        select(Spin).where(Spin.user_id == user.id).order_by(Spin.created_at.desc()).limit(10)
+    )).all()
+    bot_username = getattr(request.app.state, "bot_username", "")
+    return {
+        "user": {
+            "id": user.id, "first_name": user.first_name, "username": user.username,
+            "referrals_count": user.referrals_count, "free_spins": user.free_spins,
+            "paid_spins": user.paid_spins, "quest_points": user.quest_points,
+        },
+        "referral_link": f"https://t.me/{bot_username}?start=ref_{user.id}" if bot_username else "",
+        "stars_per_spin": settings.stars_per_spin,
+        "paid_wheel_enabled": settings.paid_wheel_enabled,
+        "quest_spin_cost": settings.quest_spin_cost,
+        "nft_claims": [
+            {"id": claim.id, "title": nft.title, "status": claim.status, "gift_url": nft.gift_url}
+            for claim, nft in claims
+        ],
+        "history": [
+            {"id": s.id, "wheel_type": s.wheel_type, "prize_type": s.prize_type,
+             "title": s.prize_title, "points_awarded": s.points_awarded,
+             "created_at": s.created_at.isoformat()}
+            for s in recent
+        ],
+    }
+
+
+@app.post("/api/spin")
+async def spin(payload: SpinRequest, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    try:
+        result = await execute_spin(session, user.id, payload.wheel_type, payload.request_id)
+        return {"ok": True, "result": result}
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tasks")
+async def tasks(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    claimed = set((await session.scalars(select(TaskClaim.task_key).where(TaskClaim.user_id == user.id))).all())
+    items = []
+    if settings.required_channel:
+        items.append({
+            "key": "subscribe_channel", "title": "Подписаться на канал",
+            "description": "Подпишитесь на официальный канал проекта и подтвердите подписку.",
+            "reward": settings.points_for_channel, "url": settings.channel_url,
+            "claimed": "subscribe_channel" in claimed,
+        })
+    items.append({
+        "key": "invite_friends", "title": "Пригласить друзей",
+        "description": f"За каждого нового участника по вашей ссылке начисляется {settings.points_per_referral} баллов автоматически.",
+        "reward": settings.points_per_referral, "url": "", "claimed": False,
+    })
+    return {"items": items, "quest_points": user.quest_points, "quest_spin_cost": settings.quest_spin_cost}
+
+
+@app.post("/api/tasks/claim")
+async def claim_task(payload: TaskClaimRequest, request: Request,
+                     user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    if payload.task_key != "subscribe_channel" or not settings.required_channel:
+        raise HTTPException(status_code=400, detail="Это задание сейчас недоступно")
+    existing = await session.scalar(select(TaskClaim).where(
+        TaskClaim.user_id == user.id, TaskClaim.task_key == payload.task_key
+    ))
+    if existing:
+        raise HTTPException(status_code=409, detail="Награда за это задание уже получена")
+    bot: Bot | None = request.app.state.bot
+    if not bot:
+        raise HTTPException(status_code=503, detail="Бот не настроен")
+    try:
+        member = await bot.get_chat_member(settings.required_channel, user.id)
+        is_member = member.status in {"member", "administrator", "creator"} or (member.status == "restricted" and getattr(member, "is_member", False))
+        if not is_member:
+            raise HTTPException(status_code=400, detail="Сначала подпишитесь на канал")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Channel membership verification failed")
+        raise HTTPException(status_code=502, detail="Не удалось проверить подписку. Проверьте права бота в канале.") from exc
+    locked_user = await session.scalar(select(User).where(User.id == user.id).with_for_update())
+    # Unique constraint protects against concurrent duplicate claims.
+    session.add(TaskClaim(user_id=user.id, task_key=payload.task_key, points_awarded=settings.points_for_channel))
+    locked_user.quest_points += settings.points_for_channel
+    try:
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Задание уже засчитано") from exc
+    return {"ok": True, "points_awarded": settings.points_for_channel}
+
+
+@app.post("/api/stars/invoice")
+async def create_stars_invoice(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    if not settings.paid_wheel_enabled:
+        raise HTTPException(status_code=403, detail="Платная рулетка отключена до проверки правил проведения розыгрыша")
+    bot: Bot | None = request.app.state.bot
+    if not bot:
+        raise HTTPException(status_code=503, detail="Бот не настроен")
+    payload = f"spin:{user.id}:{uuid.uuid4().hex}"
+    payment = Payment(user_id=user.id, payload=payload, amount=settings.stars_per_spin, currency="XTR", status="pending")
+    session.add(payment)
+    await session.commit()
+    try:
+        link = await bot.create_invoice_link(
+            title="Прокрутка ROBO LUDOMANES",
+            description="Одна прокрутка платной рулетки",
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label="Одна прокрутка", amount=settings.stars_per_spin)],
+        )
+        return {"ok": True, "invoice_url": link, "stars": settings.stars_per_spin}
+    except Exception as exc:
+        payment.status = "failed"
+        await session.commit()
+        log.exception("Could not create Telegram Stars invoice")
+        raise HTTPException(status_code=502, detail="Telegram не смог создать счёт. Попробуйте позже.") from exc
+
+
+@app.post("/api/claim")
+async def request_nft_claim(payload: ClaimRequest, request: Request,
+                            user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    claim = await session.scalar(select(NftClaim).where(
+        NftClaim.id == payload.claim_id, NftClaim.user_id == user.id
+    ).with_for_update())
+    if not claim:
+        raise HTTPException(status_code=404, detail="Выигрыш не найден")
+    if claim.status == "requested":
+        return {"ok": True, "message": "Заявка уже отправлена администратору"}
+    if claim.status != "pending":
+        raise HTTPException(status_code=409, detail="Этот подарок уже обработан")
+    nft = await session.get(NftInventory, claim.nft_id)
+    claim.status = "requested"
+    claim.requested_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    bot: Bot | None = request.app.state.bot
+    if bot and settings.admin_id:
+        try:
+            await bot.send_message(
+                settings.admin_id,
+                f"🎁 <b>Новая заявка на NFT-подарок</b>\n"
+                f"Пользователь: <code>{user.id}</code> (@{user.username or 'без username'})\n"
+                f"Подарок: <b>{nft.title if nft else 'не найден'}</b>\n"
+                f"ID заявки: <code>{claim.id}</code>\n"
+                f"Ссылка: {nft.gift_url if nft else '—'}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("Could not notify admin about NFT claim")
+    return {"ok": True, "message": "Заявка отправлена администратору"}
+
+
+@app.get("/api/history")
+async def history(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    rows = (await session.scalars(select(Spin).where(Spin.user_id == user.id).order_by(Spin.created_at.desc()).limit(50))).all()
+    return {"items": [{"id": r.id, "wheel_type": r.wheel_type, "title": r.prize_title,
+                       "prize_type": r.prize_type, "created_at": r.created_at.isoformat()} for r in rows]}
+
+
+======================================================================
+FILE: app/models.py
+======================================================================
+from datetime import datetime, timezone
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Index
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.db import Base
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Telegram user ID
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[str] = mapped_column(String(128), default="Игрок")
+    language_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    referrals_count: Mapped[int] = mapped_column(Integer, default=0)
+    free_spins: Mapped[int] = mapped_column(Integer, default=0)
+    free_spins_granted: Mapped[int] = mapped_column(Integer, default=0)
+    paid_spins: Mapped[int] = mapped_column(Integer, default=0)
+    quest_points: Mapped[int] = mapped_column(Integer, default=0)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class NftInventory(Base):
+    __tablename__ = "nft_inventory"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(160))
+    gift_url: Mapped[str] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="available", index=True)  # available/reserved/fulfilled
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Spin(Base):
+    __tablename__ = "spins"
+    __table_args__ = (UniqueConstraint("user_id", "request_id", name="uq_spin_user_request"), Index("ix_spins_user_created", "user_id", "created_at"))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    request_id: Mapped[str] = mapped_column(String(64))
+    wheel_type: Mapped[str] = mapped_column(String(16))
+    prize_type: Mapped[str] = mapped_column(String(16))
+    prize_title: Mapped[str] = mapped_column(String(160))
+    points_awarded: Mapped[int] = mapped_column(Integer, default=0)
+    nft_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("nft_inventory.id"), nullable=True)
+    payment_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("payments.id"), nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NftClaim(Base):
+    __tablename__ = "nft_claims"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    spin_id: Mapped[int] = mapped_column(Integer, ForeignKey("spins.id"), unique=True)
+    nft_id: Mapped[int] = mapped_column(Integer, ForeignKey("nft_inventory.id"))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)  # pending/requested/fulfilled
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TaskClaim(Base):
+    __tablename__ = "task_claims"
+    __table_args__ = (UniqueConstraint("user_id", "task_key", name="uq_task_user_key"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    task_key: Mapped[str] = mapped_column(String(64))
+    points_awarded: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    payload: Mapped[str] = mapped_column(String(128), unique=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="XTR")
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    charge_id: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+======================================================================
+FILE: app/schemas.py
+======================================================================
+from pydantic import BaseModel, Field
+from typing import Literal
+
+
+class SpinRequest(BaseModel):
+    wheel_type: Literal["free", "paid", "quest"]
+    request_id: str = Field(min_length=8, max_length=64)
+
+
+class ClaimRequest(BaseModel):
+    claim_id: int = Field(gt=0)
+
+
+class TaskClaimRequest(BaseModel):
+    task_key: str = Field(min_length=1, max_length=64)
+
+
+======================================================================
+FILE: app/security.py
+======================================================================
+import hashlib
+import hmac
+import json
+import time
+from urllib.parse import parse_qsl
+from fastapi import HTTPException, Header
+from app.config import get_settings
+
+
+def validate_init_data(init_data: str, bot_token: str, max_age: int) -> dict:
+    """Validate Telegram WebApp initData according to Telegram's HMAC algorithm."""
+    if not init_data or len(init_data) > 8192:
+        raise HTTPException(status_code=401, detail="Нет данных авторизации Telegram")
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+        data = dict(pairs)
+        if len(data) != len(pairs):
+            raise ValueError("duplicate keys")
+        received_hash = data.pop("hash", None)
+        if not received_hash:
+            raise ValueError("hash missing")
+        check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            raise ValueError("signature mismatch")
+        auth_date = int(data.get("auth_date", "0"))
+        now = int(time.time())
+        if auth_date <= 0 or auth_date > now + 60 or now - auth_date > max_age:
+            raise ValueError("initData expired")
+        user = json.loads(data.get("user", "{}"))
+        if not isinstance(user, dict) or not isinstance(user.get("id"), int):
+            raise ValueError("user missing")
+        return {"user": user, "auth_date": auth_date, "start_param": data.get("start_param", "")}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Недействительная или устаревшая авторизация Telegram") from exc
+
+
+async def telegram_user(x_telegram_init_data: str | None = Header(default=None)) -> dict:
+    settings = get_settings()
+    if not settings.is_configured:
+        raise HTTPException(status_code=503, detail="Сначала настройте BOT_TOKEN и ADMIN_ID в .env")
+    return validate_init_data(x_telegram_init_data or "", settings.bot_token, settings.init_data_max_age_seconds)
+
+
+======================================================================
+FILE: templates/index.html
+======================================================================
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#090b12">
+  <title>ROBO LUDOMANES</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <style>
+    :root{--bg:#090b12;--panel:#121724;--panel2:#192235;--line:#273249;--text:#f4f6fb;--muted:#9ba8bd;--gold:#ffc45b;--cyan:#66d9ee;--green:#7ee0ad;--red:#ff7686}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -15%,#263251 0,#111827 34%,var(--bg) 72%);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh;padding-bottom:84px}
+    .wrap{max-width:620px;margin:auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center;margin:8px 0 18px}.brand{font-weight:900;letter-spacing:1.5px;font-size:18px}.brand span{color:var(--gold)}.pill{font-size:11px;color:var(--green);border:1px solid #2d6955;border-radius:20px;padding:6px 10px;background:#10251e}
+    .hero{padding:22px;border:1px solid #34415b;border-radius:24px;background:linear-gradient(135deg,#1b2941,#131b2b 65%,#241e31);box-shadow:0 16px 45px #0006}.eyebrow{font-size:11px;letter-spacing:2px;color:var(--cyan);font-weight:800}.hero h1{font-size:26px;line-height:1.12;margin:9px 0}.hero p{color:#b9c5d8;font-size:13px;line-height:1.5;margin:0}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin:14px 0}.stat{background:#121a28;border:1px solid var(--line);border-radius:16px;padding:12px 10px;min-width:0}.stat small{display:block;color:var(--muted);font-size:10px;line-height:1.3}.stat b{display:block;font-size:21px;margin-top:5px;overflow:hidden;text-overflow:ellipsis}
+    .panel{background:linear-gradient(145deg,#151d2c,#101622);border:1px solid var(--line);border-radius:20px;padding:17px;margin-top:13px}.panel h2{font-size:17px;margin:0 0 7px}.muted{color:var(--muted);font-size:12px;line-height:1.45}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.btn{border:0;border-radius:13px;padding:13px 15px;font-size:13px;font-weight:800;color:#131722;background:linear-gradient(135deg,#ffd477,#f5a93e);width:100%;margin-top:12px;cursor:pointer}.btn.secondary{background:#243047;color:#e8efff;border:1px solid #3a4965}.btn.cyan{background:linear-gradient(135deg,#8aebf8,#42bbd4)}.btn:disabled{opacity:.45;cursor:not-allowed}.tabs{position:fixed;bottom:0;left:0;right:0;background:#0d121deF;backdrop-filter:blur(16px);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,1fr);padding:8px max(8px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));z-index:5}.tab{background:none;border:0;color:#8794aa;padding:5px 2px;font-size:10px;font-weight:700}.tab .ico{display:block;font-size:19px;margin-bottom:3px}.tab.active{color:var(--gold)}.screen{display:none}.screen.active{display:block}
+    .wheelbox{display:grid;place-items:center;margin:18px auto 12px;position:relative;width:min(76vw,300px);aspect-ratio:1}.wheel{width:100%;height:100%;border-radius:50%;border:8px solid #d5b46c;box-shadow:0 0 0 5px #323e56,0 14px 35px #0009;background:conic-gradient(#293a5a 0 15%,#a97936 15% 25%,#263b50 25% 40%,#6f3653 40% 50%,#293a5a 50% 65%,#a97936 65% 75%,#263b50 75% 90%,#6f3653 90% 100%);transition:transform 1.8s cubic-bezier(.12,.75,.12,1)}.wheel:after{content:'ROBO';position:absolute;inset:36%;display:grid;place-items:center;background:#111827;border:4px solid #e4c477;border-radius:50%;font-weight:900;letter-spacing:1px;color:var(--gold)}.pointer{position:absolute;top:-8px;width:0;height:0;border-left:12px solid transparent;border-right:12px solid transparent;border-top:26px solid var(--gold);z-index:2;filter:drop-shadow(0 2px 3px #000)}
+    .gift{display:flex;gap:12px;align-items:center;border:1px solid var(--line);border-radius:14px;padding:11px;margin-top:9px;background:#111927}.gift-img{width:54px;height:54px;object-fit:cover;border-radius:12px;background:#28354b}.gift b{display:block;font-size:13px}.gift small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.task{padding:12px 0;border-bottom:1px solid #273249}.task:last-child{border:0}.status{color:var(--green);font-size:11px;font-weight:700}.notice{border-radius:12px;padding:11px 13px;background:#222d40;color:#cbd7e9;font-size:12px;margin-top:10px;display:none}.notice.error{background:#3a202b;color:#ffc5cc}.empty{text-align:center;padding:20px;color:var(--muted);font-size:13px}.smalllink{color:var(--cyan);text-decoration:none;font-size:12px}.footer{text-align:center;color:#66738a;font-size:10px;padding:20px 0 8px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><div class="brand">ROBO <span>LUDOMANES</span></div><div class="pill">● ONLINE</div></div>
+  <section class="screen active" id="screen-bank">
+    <div class="hero"><div class="eyebrow">DIGITAL REWARDS SYSTEM</div><h1>Твоя игра.<br>Твои возможности.</h1><p>Выполняй задания, приглашай друзей, получай баллы и пробуй удачу в рулетках.</p></div>
+    <div class="stats">
+      <div class="stat"><small>БАЛЛЫ</small><b id="points">—</b></div>
+      <div class="stat"><small>БЕСПЛАТНЫЕ</small><b id="free">—</b></div>
+      <div class="stat"><small>ПЛАТНЫЕ</small><b id="paid">—</b></div>
+    </div>
+    <div class="panel"><div class="row"><div><h2>Твой профиль</h2><div class="muted" id="greeting">Загружаем профиль…</div></div><div style="font-size:27px">🤖</div></div><div class="row" style="margin-top:15px"><span class="muted">Приглашено друзей</span><b id="refcount">0</b></div><button class="btn secondary" onclick="showScreen('gift')">Пригласить друзей</button></div>
+    <div class="panel"><h2>Последние выигрыши</h2><div id="history" class="muted">История загрузится вместе с профилем.</div></div>
+  </section>
+
+  <section class="screen" id="screen-gift">
+    <div class="hero"><div class="eyebrow">INVITE & EARN</div><h1>Зови друзей —<br>получай бонусы.</h1><p>Баллы за нового участника начисляются после его первого запуска бота по твоей персональной ссылке. За каждые 3 приглашения — бесплатная прокрутка.</p></div>
+    <div class="stats"><div class="stat"><small>РЕФЕРАЛЫ</small><b id="refcount2">0</b></div><div class="stat"><small>БАЛЛЫ</small><b id="points2">0</b></div><div class="stat"><small>БЕСПЛАТНЫЕ</small><b id="free2">0</b></div></div>
+    <div class="panel"><h2>Твоя ссылка</h2><div class="muted" id="refurl">Ссылка появится после настройки бота.</div><button class="btn" id="copyref" onclick="copyReferral()" disabled>Скопировать ссылку</button><button class="btn secondary" id="shareref" onclick="shareReferral()" disabled>Поделиться</button></div>
+    <div class="panel"><h2>Мои подарки</h2><div id="claims" class="muted">Пока нет выигранных подарков.</div></div>
+  </section>
+
+  <section class="screen" id="screen-roulette">
+    <div class="hero"><div class="eyebrow">LUCKY ENGINE</div><h1>Выбери рулетку.</h1><p>Результат каждой прокрутки определяет сервер. Анимация колеса — только визуальный эффект.</p></div>
+    <div class="panel"><h2>Бесплатная рулетка</h2><div class="muted">Стоимость: 1 бесплатная попытка. Попытка начисляется за каждые 3 подтверждённых приглашения.</div><button class="btn" onclick="spin('free')">Крутить бесплатно</button></div>
+    <div class="panel"><h2>Рулетка за баллы</h2><div class="muted">Стоимость: <b id="questcost">100</b> баллов за прокрутку.</div><button class="btn cyan" onclick="spin('quest')">Крутить за баллы</button></div>
+    <div class="panel"><h2>Платная рулетка</h2><div class="muted">Одна попытка — <b id="starcost">50</b> Telegram Stars. После подтверждённой оплаты попытка поступит на баланс.</div><button class="btn secondary" onclick="buySpin()">Купить прокрутку за Stars</button></div>
+    <div class="panel"><div class="wheelbox"><div class="pointer"></div><div class="wheel" id="wheel"></div></div><div class="muted" style="text-align:center">Не закрывай приложение до появления результата.</div><div id="result" class="notice"></div></div>
+  </section>
+
+  <section class="screen" id="screen-tasks">
+    <div class="hero"><div class="eyebrow">MISSIONS</div><h1>Задания и награды.</h1><p>Выполняй доступные задания, получай баллы и используй их в рулетке.</p></div>
+    <div class="panel"><div class="row"><h2>Мои баллы</h2><b id="taskpoints">0</b></div><div id="tasks"><div class="empty">Загружаем задания…</div></div></div>
+  </section>
+  <div class="footer">ROBO LUDOMANES · игровые баллы не являются денежными средствами</div>
+</div>
+<nav class="tabs">
+  <button class="tab active" data-screen="bank" onclick="showScreen('bank')"><span class="ico">▦</span>Банк</button>
+  <button class="tab" data-screen="gift" onclick="showScreen('gift')"><span class="ico">🎁</span>Подарки</button>
+  <button class="tab" data-screen="roulette" onclick="showScreen('roulette')"><span class="ico">◉</span>Рулетка</button>
+  <button class="tab" data-screen="tasks" onclick="showScreen('tasks')"><span class="ico">☷</span>Задания</button>
+</nav>
+<script>
+  const tg = window.Telegram?.WebApp;
+  const initData = tg?.initData || '';
+  if (tg) { tg.ready(); tg.expand(); }
+  let state = null;
+  let busy = false;
+  const $ = (id) => document.getElementById(id);
+  function showNotice(message, error=false) { const el=$('result'); el.textContent=message; el.className='notice'+(error?' error':''); el.style.display='block'; }
+  async function api(path, options={}) {
+    if (!initData) throw new Error('Открой приложение через Telegram-бота. В обычном браузере авторизация недоступна.');
+    const response = await fetch(path, { ...options, headers: { 'Content-Type':'application/json', 'X-Telegram-Init-Data':initData, ...(options.headers||{}) } });
+    const data = await response.json().catch(()=>({detail:'Ошибка ответа сервера'}));
+    if (!response.ok) throw new Error(data.detail || 'Ошибка запроса');
+    return data;
+  }
+  function render() {
+    if (!state) return;
+    const u=state.user;
+    $('points').textContent=u.quest_points; $('free').textContent=u.free_spins; $('paid').textContent=u.paid_spins;
+    $('refcount').textContent=u.referrals_count; $('refcount2').textContent=u.referrals_count;
+    $('points2').textContent=u.quest_points; $('free2').textContent=u.free_spins;
+    $('taskpoints').textContent=u.quest_points; $('greeting').textContent=`${u.first_name}, добро пожаловать в игру.`;
+    $('questcost').textContent=state.quest_spin_cost; $('starcost').textContent=state.stars_per_spin;
+    const paidButton=document.querySelector("button[onclick=\"buySpin()\"]"); if(paidButton){paidButton.disabled=!state.paid_wheel_enabled;paidButton.textContent=state.paid_wheel_enabled?"Купить прокрутку за Stars":"Платная рулетка отключена";}
+    if (state.referral_link) {
+      $('refurl').textContent=state.referral_link; $('copyref').disabled=false; $('shareref').disabled=false;
+    } else $('refurl').textContent='Не удалось получить ссылку. Проверь username бота и перезапусти приложение.';
+    const claims=state.nft_claims||[];
+    $('claims').innerHTML=claims.length ? claims.map(c=>`<div class="gift"><div style="font-size:27px">🎁</div><div style="flex:1"><b>${escapeHtml(c.title)}</b><small>Статус: ${escapeHtml(c.status)}</small></div>${c.status==='pending'?`<button class="btn" style="width:auto;margin:0" onclick="claimGift(${c.id})">Забрать</button>`:''}</div>`).join('') : '<div class="empty">Пока нет выигранных подарков.</div>';
+    const hist=state.history||[];
+    $('history').innerHTML=hist.length ? hist.slice(0,5).map(h=>`<div style="padding:7px 0;border-bottom:1px solid #263247">${escapeHtml(h.title)} <span style="float:right;color:#8e9bb1">${escapeHtml(h.wheel_type)}</span></div>`).join('') : 'Пока нет прокруток.';
+  }
+  function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+  async function load() {
+    try { state=await api('/api/me'); render(); await loadTasks(); }
+    catch(e){ $('greeting').textContent=e.message; $('history').textContent=e.message; }
+  }
+  async function loadTasks() {
+    try {
+      const data=await api('/api/tasks'); $('taskpoints').textContent=data.quest_points;
+      $('tasks').innerHTML=data.items.map(t=>`<div class="task"><div class="row"><b>${escapeHtml(t.title)}</b><span class="status">+${t.reward} баллов</span></div><div class="muted" style="margin:5px 0 7px">${escapeHtml(t.description)}</div>${t.claimed?'<span class="status">✓ Выполнено</span>':t.key==='subscribe_channel'?`<div class="row"><a class="smalllink" href="${escapeHtml(t.url||'#')}" target="_blank">Открыть канал</a><button class="btn" style="width:auto;margin:0" onclick="claimTask('${t.key}')">Проверить</button></div>`:'<span class="muted">Начисляется автоматически</span>'}</div>`).join('') || '<div class="empty">Сейчас нет доступных заданий.</div>';
+    } catch(e){ $('tasks').innerHTML=`<div class="empty">${escapeHtml(e.message)}</div>`; }
+  }
+  function showScreen(name) {
+    document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+    $('screen-'+name).classList.add('active');
+    document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.screen===name));
+  }
+  async function spin(type) {
+    if (busy) return; busy=true; $('result').style.display='none';
+    const wheel=$('wheel'); wheel.style.transform=`rotate(${1440+Math.floor(Math.random()*360)}deg)`;
+    try {
+      const requestId=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const data=await api('/api/spin',{method:'POST',body:JSON.stringify({wheel_type:type,request_id:requestId})});
+      await new Promise(r=>setTimeout(r,1850));
+      const p=data.result;
+      let msg='🎲 '+p.title;
+      if (p.prize_type==='nft') msg='🎉 Выпал подарок: '+p.title+'. Забери его во вкладке «Подарки». Оно уже закреплено за твоим аккаунтом.';
+      else if (p.points_awarded) msg=`✨ ${p.title}. Баллы зачислены на баланс.`;
+      showNotice(msg); await load();
+    } catch(e){showNotice(e.message,true); await load();}
+    finally {busy=false;}
+  }
+  async function buySpin() {
+    try {const data=await api('/api/stars/invoice',{method:'POST',body:'{}'}); if(tg?.openInvoice) tg.openInvoice(data.invoice_url,(status)=>{if(status==='paid'){showNotice('Оплата принята Telegram. Обновляю баланс…');setTimeout(load,1500);}}); else window.location.href=data.invoice_url;}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function claimGift(id) {
+    try {const d=await api('/api/claim',{method:'POST',body:JSON.stringify({claim_id:id})}); showNotice(d.message); await load();}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function claimTask(key) {
+    try {await api('/api/tasks/claim',{method:'POST',body:JSON.stringify({task_key:key})}); showNotice('Задание подтверждено. Баллы начислены.'); await load();}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function copyReferral(){if(!state?.referral_link)return;try{await navigator.clipboard.writeText(state.referral_link);showNotice('Ссылка скопирована.');}catch(e){showNotice('Не удалось скопировать ссылку.',true);}}
+  function shareReferral(){if(!state?.referral_link)return;const url='https://t.me/share/url?url='+encodeURIComponent(state.referral_link)+'&text='+encodeURIComponent('Присоединяйся к ROBO LUDOMANES!');if(tg)tg.openTelegramLink(url);else window.open(url,'_blank');}
+  if(tg?.onEvent) tg.onEvent('invoiceClosed',(event)=>{if(event.status==='paid')load();});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
+  load();
+</script>
+</body>
+</html>
+
+
+======================================================================
+FILE: tests/test_security.py
+======================================================================
+import hashlib
+import hmac
+import json
+import time
+import unittest
+from urllib.parse import urlencode
+from app.security import validate_init_data
+
+
+class TelegramInitDataTests(unittest.TestCase):
+    def make_init_data(self, token: str, user_id: int):
+        data = {
+            "auth_date": str(int(time.time())),
+            "user": json.dumps({"id": user_id, "first_name": "Test"}, separators=(",", ":")),
+        }
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        data["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        return urlencode(data)
+
+    def test_valid_data(self):
+        token = "123456:TEST_TOKEN"
+        result = validate_init_data(self.make_init_data(token, 12345), token, 86400)
+        self.assertEqual(result["user"]["id"], 12345)
+
+    def test_tampered_data_rejected(self):
+        token = "123456:TEST_TOKEN"
+        raw = self.make_init_data(token, 12345).replace("12345", "99999")
+        with self.assertRaises(Exception):
+            validate_init_data(raw, token, 86400)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+======================================================================
+FILE: requirements.txt
+======================================================================
+aiogram>=3.20,<4
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.20,<1
+pydantic-settings>=2.5,<3
+
+
+======================================================================
+FILE: requirements-vps.txt
+======================================================================
+-r requirements.txt
+asyncpg>=0.29,<1
+
+
+======================================================================
+FILE: docker-compose.yml
+======================================================================
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: robo
+      POSTGRES_USER: robo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U robo -d robo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://robo:${POSTGRES_PASSWORD}@db:5432/robo
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://robo:${POSTGRES_PASSWORD}@db:5432/robo
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python bot.py
+
+volumes:
+  postgres_data:
+
+
+======================================================================
+FILE: Dockerfile
+======================================================================
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt requirements-vps.txt ./
+RUN pip install --no-cache-dir -r requirements-vps.txt \
+    && adduser --disabled-password --gecos "" --uid 10001 appuser
+COPY --chown=appuser:appuser . .
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+
+
+======================================================================
+FILE: README_RU.md
+======================================================================
+# ROBO LUDOMANES — новая серверная основа
+
+Проект разделён на Telegram-бота, Mini App и API. Локально можно проверять на SQLite в Termux. Для публичного запуска используйте VPS и PostgreSQL через Docker Compose.
+
+## Что реализовано
+
+- Авторизация Mini App через криптографическую проверку `Telegram.WebApp.initData`; переданный браузером `user_id` не используется как источник доверия.
+- Регистрация пользователей и рефералов через `/start ref_TELEGRAM_ID`.
+- Баллы за действительно нового пользователя; одна регистрация засчитывается только один раз.
+- Бесплатная прокрутка за каждые 3 приглашения (число настраивается).
+- Три рулетки: бесплатная, за баллы и платная.
+- Результат, баланс, списания и призы определяются сервером.
+- Идемпотентность прокруток по `request_id`, чтобы повторный сетевой запрос не списал попытку второй раз.
+- Платная попытка покупается через Telegram Stars (`XTR`). Mini App открывает нативный счёт Telegram, а попытка начисляется только после `successful_payment`, а не после нажатия кнопки оплаты. Администратор может посмотреть платежи через `/payments` и вернуть неиспользованную попытку командой `/refund ID`.
+- Задание подписки проверяется через `getChatMember`; бот должен быть администратором канала.
+- NFT-приз выпадает только из фактически добавленного запаса подарков. Победа создаёт персональную заявку; произвольный ID чужого подарка принять нельзя.
+- Админ-команды `/stats`, `/addgift`, `/giftstock`, `/fulfill`, `/payments`, `/refund`.
+- `/paysupport` для обращений по оплатам.
+
+## 1. Подготовка в Termux
+
+Установите Python и системные инструменты. Для автоматической установки зависимостей после распаковки можно запустить `bash install_termux.sh`; ниже приведён ручной вариант:
+
+```bash
+pkg update -y && pkg upgrade -y
+pkg install python git nano clang libffi openssl -y
+```
+
+Распакуйте проект, перейдите в папку `robo_ludomanes` и выполните:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+cp .env.example .env
+nano .env
+```
+
+Откройте бота в Telegram и отправьте ему `/start` (это также позволит боту писать администратору об NFT-заявках и оплатах). Заполните как минимум:
+
+- `BOT_TOKEN` — токен из BotFather;
+- `ADMIN_ID` — ваш Telegram ID числом;
+- `WEBAPP_URL` — публичный HTTPS-адрес Mini App. Для локального теста без публичного HTTPS можно проверять API, но Telegram Mini App не откроется с обычного `http://` адреса.
+
+Локальная установка через `requirements.txt` использует SQLite и не требует компиляции драйвера PostgreSQL. Для публичного VPS-деплоя Docker дополнительно устанавливает `asyncpg` через `requirements-vps.txt`.
+
+Для локального запуска оставьте SQLite:
+
+```env
+DATABASE_URL=sqlite+aiosqlite:///./database.db
+```
+
+## 2. Запуск в Termux
+
+Нужны два процесса — API и бот. Откройте две сессии Termux.
+
+**Сессия №1 — API:**
+
+```bash
+cd ~/robo_ludomanes
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+**Сессия №2 — бот:**
+
+```bash
+cd ~/robo_ludomanes
+source .venv/bin/activate
+python bot.py
+```
+
+Проверка API: откройте `http://127.0.0.1:8000/health`. Ожидаемый ответ: `{"status":"ok","service":"robo-ludomanes"}`. Для проверки базы данных также доступен `/ready`.
+
+Для проверки Mini App в самом Telegram нужен доступный из интернета HTTPS URL. Не публикуйте порт Termux напрямую без HTTPS и не рассчитывайте на Serveo как на постоянную инфраструктуру. Для временного теста используйте HTTPS-туннель, а для запуска на аудиторию — VPS с доменом и TLS.
+
+## 3. Настройка канала для задания
+
+Добавьте бота администратором в канал. В `.env` укажите:
+
+```env
+REQUIRED_CHANNEL=@имя_канала
+CHANNEL_URL=https://t.me/имя_канала
+POINTS_FOR_CHANNEL=50
+```
+
+Перезапустите API и бота. Если бот не администратор канала, Telegram не гарантирует корректную проверку подписки.
+
+## 4. Добавление NFT-подарков
+
+В личном чате с ботом от администратора:
+
+```text
+/addgift Название подарка | https://ссылка-на-подарок | https://ссылка-на-изображение
+```
+
+Изображение необязательно. Посмотреть запас:
+
+```text
+/giftstock
+```
+
+Администратор получает уведомление о заявке. После фактической выдачи отметьте её:
+
+```text
+/fulfill ID_ЗАЯВКИ
+```
+
+Не добавляйте в запас подарки, которыми проект не располагает.
+
+## 5. Переход на VPS
+
+1. Направьте домен на VPS и настройте HTTPS через Caddy, Nginx + Certbot или аналогичный reverse proxy.
+2. Установите Docker Engine и Docker Compose plugin.
+3. Создайте `.env` на VPS на основе `.env.example`.
+4. В `WEBAPP_URL` укажите HTTPS адрес Mini App.
+5. Установите `POSTGRES_PASSWORD` в случайный длинный пароль (например, результат `openssl rand -hex 32`).
+6. Запустите:
+
+```bash
+docker compose up -d --build
+```
+
+7. Reverse proxy должен проксировать HTTPS-трафик на `127.0.0.1:8000`.
+8. Проверьте `https://ВАШ-ДОМЕН/health`, затем откройте `/start` у бота.
+
+Пример значения `POSTGRES_PASSWORD` генерируйте отдельно, например `openssl rand -hex 32`. Не используйте примерный или простой пароль.
+
+## 6. Правила игры и настройки
+
+| Переменная | Назначение | По умолчанию |
+|---|---|---:|
+| `STARS_PER_SPIN` | Цена одной платной попытки | 50 Stars |
+| `PAID_WHEEL_ENABLED` | Разрешить платную рулетку после правовой проверки | false |
+| `QUEST_SPIN_COST` | Стоимость рулетки за баллы | 100 баллов |
+| `REFERRALS_PER_FREE_SPIN` | Приглашений на бесплатную попытку | 3 |
+| `POINTS_PER_REFERRAL` | Баллы за нового реферала | 10 |
+| `POINTS_FOR_CHANNEL` | Баллы за подписку | 50 |
+
+Платная рулетка по умолчанию отключена (`PAID_WHEEL_ENABLED=false`). Включайте её только после проверки местных законов, правил Telegram и юридической модели призов. Если механика с оплатой и случайными призами подпадает под регулирование азартных игр или лотерей, одного технического решения недостаточно. После согласования можно установить `PAID_WHEEL_ENABLED=true`.
+
+Текущая таблица шансов при наличии подарков: 56 весовых долей — пустой результат, 40 — баллы (10/25/50 с разными весами), 4 — NFT. Если запас NFT пуст, NFT-сектор не участвует в розыгрыше.
+
+## 7. Проверка перед публичным запуском
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall app bot.py
+```
+
+Обязательно проведите тестовые оплаты через тестовое окружение Telegram Stars, тесты повторных запросов, одновременных прокруток, подписки на канал, возвратов и восстановления базы из резервной копии.
+
+## Важно перед запуском на 5–7 тысяч пользователей
+
+Эта сборка — рабочая стартовая версия с базовыми защитами, а не заверенный аудитом финансовый продукт. До публикации необходимо:
+
+- заменить тестовый токен, который ранее находился в исходном коде, через BotFather; хранить новый только в `.env`/секретах VPS;
+- поставить HTTPS и домен; не запускать публичный сервис через Flask development server или постоянный Serveo-туннель;
+- настроить ежедневные резервные копии PostgreSQL и проверить восстановление;
+- добавить миграции схемы БД (Alembic) до дальнейших обновлений;
+- провести нагрузочное тестирование с профилем одновременных пользователей, а не только по общему количеству регистраций;
+- проверить условия розыгрыша, правила возвратов, поддержку платежей и юридические требования к механике призов в регионе запуска.
+
+В PostgreSQL выставлен пул соединений API/бота (10 основных + до 20 дополнительных соединений на процесс). У проекта нет Redis, потому что для базовой нагрузки 5–7 тысяч зарегистрированных пользователей он не обязателен. Его можно добавить при реальном росте нагрузки — например для распределённого rate limiting и фоновых задач.
+
+## 8. Резервное копирование и кнопка Mini App
+
+На VPS резервную копию PostgreSQL можно создать так:
+
+```bash
+bash backup_db.sh
+```
+
+Для ежедневного запуска настройте cron на VPS и храните копии ещё и вне самого сервера. Периодически проверяйте восстановление из копии. Не используйте `docker compose down -v`, если не хотите удалить том с базой данных.
+
+После того как домен и HTTPS готовы, в BotFather можно дополнительно настроить Menu Button: `/setmenubutton` → выбрать бота → указать текст кнопки и `WEBAPP_URL`. Основная кнопка открытия приложения уже отправляется командой `/start`.
+
+Файл `Caddyfile.example` — минимальный пример reverse proxy для Caddy на VPS. Замените `your-domain.example` на свой домен; DNS должен вести на VPS, а входящие порты 80 и 443 должны быть доступны.
