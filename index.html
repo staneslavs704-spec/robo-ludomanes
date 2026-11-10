@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#090b12">
+  <title>ROBO LUDOMANES</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <style>
+    :root{--bg:#090b12;--panel:#121724;--panel2:#192235;--line:#273249;--text:#f4f6fb;--muted:#9ba8bd;--gold:#ffc45b;--cyan:#66d9ee;--green:#7ee0ad;--red:#ff7686}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -15%,#263251 0,#111827 34%,var(--bg) 72%);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh;padding-bottom:84px}
+    .wrap{max-width:620px;margin:auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center;margin:8px 0 18px}.brand{font-weight:900;letter-spacing:1.5px;font-size:18px}.brand span{color:var(--gold)}.pill{font-size:11px;color:var(--green);border:1px solid #2d6955;border-radius:20px;padding:6px 10px;background:#10251e}
+    .hero{padding:22px;border:1px solid #34415b;border-radius:24px;background:linear-gradient(135deg,#1b2941,#131b2b 65%,#241e31);box-shadow:0 16px 45px #0006}.eyebrow{font-size:11px;letter-spacing:2px;color:var(--cyan);font-weight:800}.hero h1{font-size:26px;line-height:1.12;margin:9px 0}.hero p{color:#b9c5d8;font-size:13px;line-height:1.5;margin:0}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin:14px 0}.stat{background:#121a28;border:1px solid var(--line);border-radius:16px;padding:12px 10px;min-width:0}.stat small{display:block;color:var(--muted);font-size:10px;line-height:1.3}.stat b{display:block;font-size:21px;margin-top:5px;overflow:hidden;text-overflow:ellipsis}
+    .panel{background:linear-gradient(145deg,#151d2c,#101622);border:1px solid var(--line);border-radius:20px;padding:17px;margin-top:13px}.panel h2{font-size:17px;margin:0 0 7px}.muted{color:var(--muted);font-size:12px;line-height:1.45}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.btn{border:0;border-radius:13px;padding:13px 15px;font-size:13px;font-weight:800;color:#131722;background:linear-gradient(135deg,#ffd477,#f5a93e);width:100%;margin-top:12px;cursor:pointer}.btn.secondary{background:#243047;color:#e8efff;border:1px solid #3a4965}.btn.cyan{background:linear-gradient(135deg,#8aebf8,#42bbd4)}.btn:disabled{opacity:.45;cursor:not-allowed}.tabs{position:fixed;bottom:0;left:0;right:0;background:#0d121deF;backdrop-filter:blur(16px);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,1fr);padding:8px max(8px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));z-index:5}.tab{background:none;border:0;color:#8794aa;padding:5px 2px;font-size:10px;font-weight:700}.tab .ico{display:block;font-size:19px;margin-bottom:3px}.tab.active{color:var(--gold)}.screen{display:none}.screen.active{display:block}
+    .wheelbox{display:grid;place-items:center;margin:18px auto 12px;position:relative;width:min(76vw,300px);aspect-ratio:1}.wheel{width:100%;height:100%;border-radius:50%;border:8px solid #d5b46c;box-shadow:0 0 0 5px #323e56,0 14px 35px #0009;background:conic-gradient(#293a5a 0 15%,#a97936 15% 25%,#263b50 25% 40%,#6f3653 40% 50%,#293a5a 50% 65%,#a97936 65% 75%,#263b50 75% 90%,#6f3653 90% 100%);transition:transform 1.8s cubic-bezier(.12,.75,.12,1)}.wheel:after{content:'ROBO';position:absolute;inset:36%;display:grid;place-items:center;background:#111827;border:4px solid #e4c477;border-radius:50%;font-weight:900;letter-spacing:1px;color:var(--gold)}.pointer{position:absolute;top:-8px;width:0;height:0;border-left:12px solid transparent;border-right:12px solid transparent;border-top:26px solid var(--gold);z-index:2;filter:drop-shadow(0 2px 3px #000)}
+    .gift{display:flex;gap:12px;align-items:center;border:1px solid var(--line);border-radius:14px;padding:11px;margin-top:9px;background:#111927}.gift-img{width:54px;height:54px;object-fit:cover;border-radius:12px;background:#28354b}.gift b{display:block;font-size:13px}.gift small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.task{padding:12px 0;border-bottom:1px solid #273249}.task:last-child{border:0}.status{color:var(--green);font-size:11px;font-weight:700}.notice{border-radius:12px;padding:11px 13px;background:#222d40;color:#cbd7e9;font-size:12px;margin-top:10px;display:none}.notice.error{background:#3a202b;color:#ffc5cc}.empty{text-align:center;padding:20px;color:var(--muted);font-size:13px}.smalllink{color:var(--cyan);text-decoration:none;font-size:12px}.footer{text-align:center;color:#66738a;font-size:10px;padding:20px 0 8px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><div class="brand">ROBO <span>LUDOMANES</span></div><div class="pill">● ONLINE</div></div>
+  <section class="screen active" id="screen-bank">
+    <div class="hero"><div class="eyebrow">DIGITAL REWARDS SYSTEM</div><h1>Твоя игра.<br>Твои возможности.</h1><p>Выполняй задания, приглашай друзей, получай баллы и пробуй удачу в рулетках.</p></div>
+    <div class="stats">
+      <div class="stat"><small>БАЛЛЫ</small><b id="points">—</b></div>
+      <div class="stat"><small>БЕСПЛАТНЫЕ</small><b id="free">—</b></div>
+      <div class="stat"><small>ПЛАТНЫЕ</small><b id="paid">—</b></div>
+    </div>
+    <div class="panel"><div class="row"><div><h2>Твой профиль</h2><div class="muted" id="greeting">Загружаем профиль…</div></div><div style="font-size:27px">🤖</div></div><div class="row" style="margin-top:15px"><span class="muted">Приглашено друзей</span><b id="refcount">0</b></div><button class="btn secondary" onclick="showScreen('gift')">Пригласить друзей</button></div>
+    <div class="panel"><h2>Последние выигрыши</h2><div id="history" class="muted">История загрузится вместе с профилем.</div></div>
+  </section>
+
+  <section class="screen" id="screen-gift">
+    <div class="hero"><div class="eyebrow">INVITE & EARN</div><h1>Зови друзей —<br>получай бонусы.</h1><p>Баллы за нового участника начисляются после его первого запуска бота по твоей персональной ссылке. За каждые 3 приглашения — бесплатная прокрутка.</p></div>
+    <div class="stats"><div class="stat"><small>РЕФЕРАЛЫ</small><b id="refcount2">0</b></div><div class="stat"><small>БАЛЛЫ</small><b id="points2">0</b></div><div class="stat"><small>БЕСПЛАТНЫЕ</small><b id="free2">0</b></div></div>
+    <div class="panel"><h2>Твоя ссылка</h2><div class="muted" id="refurl">Ссылка появится после настройки бота.</div><button class="btn" id="copyref" onclick="copyReferral()" disabled>Скопировать ссылку</button><button class="btn secondary" id="shareref" onclick="shareReferral()" disabled>Поделиться</button></div>
+    <div class="panel"><h2>Мои подарки</h2><div id="claims" class="muted">Пока нет выигранных подарков.</div></div>
+  </section>
+
+  <section class="screen" id="screen-roulette">
+    <div class="hero"><div class="eyebrow">LUCKY ENGINE</div><h1>Выбери рулетку.</h1><p>Результат каждой прокрутки определяет сервер. Анимация колеса — только визуальный эффект.</p></div>
+    <div class="panel"><h2>Бесплатная рулетка</h2><div class="muted">Стоимость: 1 бесплатная попытка. Попытка начисляется за каждые 3 подтверждённых приглашения.</div><button class="btn" onclick="spin('free')">Крутить бесплатно</button></div>
+    <div class="panel"><h2>Рулетка за баллы</h2><div class="muted">Стоимость: <b id="questcost">100</b> баллов за прокрутку.</div><button class="btn cyan" onclick="spin('quest')">Крутить за баллы</button></div>
+    <div class="panel"><h2>Платная рулетка</h2><div class="muted">Одна попытка — <b id="starcost">50</b> Telegram Stars. После подтверждённой оплаты попытка поступит на баланс.</div><button class="btn secondary" onclick="buySpin()">Купить прокрутку за Stars</button></div>
+    <div class="panel"><div class="wheelbox"><div class="pointer"></div><div class="wheel" id="wheel"></div></div><div class="muted" style="text-align:center">Не закрывай приложение до появления результата.</div><div id="result" class="notice"></div></div>
+  </section>
+
+  <section class="screen" id="screen-tasks">
+    <div class="hero"><div class="eyebrow">MISSIONS</div><h1>Задания и награды.</h1><p>Выполняй доступные задания, получай баллы и используй их в рулетке.</p></div>
+    <div class="panel"><div class="row"><h2>Мои баллы</h2><b id="taskpoints">0</b></div><div id="tasks"><div class="empty">Загружаем задания…</div></div></div>
+  </section>
+  <div class="footer">ROBO LUDOMANES · игровые баллы не являются денежными средствами</div>
+</div>
+<nav class="tabs">
+  <button class="tab active" data-screen="bank" onclick="showScreen('bank')"><span class="ico">▦</span>Банк</button>
+  <button class="tab" data-screen="gift" onclick="showScreen('gift')"><span class="ico">🎁</span>Подарки</button>
+  <button class="tab" data-screen="roulette" onclick="showScreen('roulette')"><span class="ico">◉</span>Рулетка</button>
+  <button class="tab" data-screen="tasks" onclick="showScreen('tasks')"><span class="ico">☷</span>Задания</button>
+</nav>
+<script>
+  const tg = window.Telegram?.WebApp;
+  const initData = tg?.initData || '';
+  if (tg) { tg.ready(); tg.expand(); }
+  let state = null;
+  let busy = false;
+  const $ = (id) => document.getElementById(id);
+  function showNotice(message, error=false) { const el=$('result'); el.textContent=message; el.className='notice'+(error?' error':''); el.style.display='block'; }
+  async function api(path, options={}) {
+    if (!initData) throw new Error('Открой приложение через Telegram-бота. В обычном браузере авторизация недоступна.');
+    const response = await fetch(path, { ...options, headers: { 'Content-Type':'application/json', 'X-Telegram-Init-Data':initData, ...(options.headers||{}) } });
+    const data = await response.json().catch(()=>({detail:'Ошибка ответа сервера'}));
+    if (!response.ok) throw new Error(data.detail || 'Ошибка запроса');
+    return data;
+  }
+  function render() {
+    if (!state) return;
+    const u=state.user;
+    $('points').textContent=u.quest_points; $('free').textContent=u.free_spins; $('paid').textContent=u.paid_spins;
+    $('refcount').textContent=u.referrals_count; $('refcount2').textContent=u.referrals_count;
+    $('points2').textContent=u.quest_points; $('free2').textContent=u.free_spins;
+    $('taskpoints').textContent=u.quest_points; $('greeting').textContent=`${u.first_name}, добро пожаловать в игру.`;
+    $('questcost').textContent=state.quest_spin_cost; $('starcost').textContent=state.stars_per_spin;
+    const paidButton=document.querySelector("button[onclick=\"buySpin()\"]"); if(paidButton){paidButton.disabled=!state.paid_wheel_enabled;paidButton.textContent=state.paid_wheel_enabled?"Купить прокрутку за Stars":"Платная рулетка отключена";}
+    if (state.referral_link) {
+      $('refurl').textContent=state.referral_link; $('copyref').disabled=false; $('shareref').disabled=false;
+    } else $('refurl').textContent='Не удалось получить ссылку. Проверь username бота и перезапусти приложение.';
+    const claims=state.nft_claims||[];
+    $('claims').innerHTML=claims.length ? claims.map(c=>`<div class="gift"><div style="font-size:27px">🎁</div><div style="flex:1"><b>${escapeHtml(c.title)}</b><small>Статус: ${escapeHtml(c.status)}</small></div>${c.status==='pending'?`<button class="btn" style="width:auto;margin:0" onclick="claimGift(${c.id})">Забрать</button>`:''}</div>`).join('') : '<div class="empty">Пока нет выигранных подарков.</div>';
+    const hist=state.history||[];
+    $('history').innerHTML=hist.length ? hist.slice(0,5).map(h=>`<div style="padding:7px 0;border-bottom:1px solid #263247">${escapeHtml(h.title)} <span style="float:right;color:#8e9bb1">${escapeHtml(h.wheel_type)}</span></div>`).join('') : 'Пока нет прокруток.';
+  }
+  function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+  async function load() {
+    try { state=await api('/api/me'); render(); await loadTasks(); }
+    catch(e){ $('greeting').textContent=e.message; $('history').textContent=e.message; }
+  }
+  async function loadTasks() {
+    try {
+      const data=await api('/api/tasks'); $('taskpoints').textContent=data.quest_points;
+      $('tasks').innerHTML=data.items.map(t=>`<div class="task"><div class="row"><b>${escapeHtml(t.title)}</b><span class="status">+${t.reward} баллов</span></div><div class="muted" style="margin:5px 0 7px">${escapeHtml(t.description)}</div>${t.claimed?'<span class="status">✓ Выполнено</span>':t.key==='subscribe_channel'?`<div class="row"><a class="smalllink" href="${escapeHtml(t.url||'#')}" target="_blank">Открыть канал</a><button class="btn" style="width:auto;margin:0" onclick="claimTask('${t.key}')">Проверить</button></div>`:'<span class="muted">Начисляется автоматически</span>'}</div>`).join('') || '<div class="empty">Сейчас нет доступных заданий.</div>';
+    } catch(e){ $('tasks').innerHTML=`<div class="empty">${escapeHtml(e.message)}</div>`; }
+  }
+  function showScreen(name) {
+    document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+    $('screen-'+name).classList.add('active');
+    document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.screen===name));
+  }
+  async function spin(type) {
+    if (busy) return; busy=true; $('result').style.display='none';
+    const wheel=$('wheel'); wheel.style.transform=`rotate(${1440+Math.floor(Math.random()*360)}deg)`;
+    try {
+      const requestId=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const data=await api('/api/spin',{method:'POST',body:JSON.stringify({wheel_type:type,request_id:requestId})});
+      await new Promise(r=>setTimeout(r,1850));
+      const p=data.result;
+      let msg='🎲 '+p.title;
+      if (p.prize_type==='nft') msg='🎉 Выпал подарок: '+p.title+'. Забери его во вкладке «Подарки». Оно уже закреплено за твоим аккаунтом.';
+      else if (p.points_awarded) msg=`✨ ${p.title}. Баллы зачислены на баланс.`;
+      showNotice(msg); await load();
+    } catch(e){showNotice(e.message,true); await load();}
+    finally {busy=false;}
+  }
+  async function buySpin() {
+    try {const data=await api('/api/stars/invoice',{method:'POST',body:'{}'}); if(tg?.openInvoice) tg.openInvoice(data.invoice_url,(status)=>{if(status==='paid'){showNotice('Оплата принята Telegram. Обновляю баланс…');setTimeout(load,1500);}}); else window.location.href=data.invoice_url;}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function claimGift(id) {
+    try {const d=await api('/api/claim',{method:'POST',body:JSON.stringify({claim_id:id})}); showNotice(d.message); await load();}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function claimTask(key) {
+    try {await api('/api/tasks/claim',{method:'POST',body:JSON.stringify({task_key:key})}); showNotice('Задание подтверждено. Баллы начислены.'); await load();}
+    catch(e){showNotice(e.message,true);}
+  }
+  async function copyReferral(){if(!state?.referral_link)return;try{await navigator.clipboard.writeText(state.referral_link);showNotice('Ссылка скопирована.');}catch(e){showNotice('Не удалось скопировать ссылку.',true);}}
+  function shareReferral(){if(!state?.referral_link)return;const url='https://t.me/share/url?url='+encodeURIComponent(state.referral_link)+'&text='+encodeURIComponent('Присоединяйся к ROBO LUDOMANES!');if(tg)tg.openTelegramLink(url);else window.open(url,'_blank');}
+  if(tg?.onEvent) tg.onEvent('invoiceClosed',(event)=>{if(event.status==='paid')load();});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
+  load();
+</script>
+</body>
+</html>
